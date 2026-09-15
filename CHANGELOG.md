@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Coordinate `click`, `scroll`, and `drag` inputs are mapped from the
+  returned (possibly downscaled) screenshot payload back to capture pixels,
+  so clicks land where the agent saw them when the image was resized.
+  Accessibility-tree targets are unchanged (already capture-space).
+
 ## [0.5.0] - 2026-08-31
 
 ### Added

@@ -77,6 +77,9 @@ pub struct ComputerUseLinux {
     /// Cached physical desktop size from the most recent full-frame capture;
     /// used for off-screen warnings and portal logical-coordinate mapping.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
+    /// Last returned screenshot payload; maps payload pixels back to capture
+    /// space for click/scroll/drag.
+    last_payload: Arc<Mutex<Option<ReturnedPayload>>>,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -349,7 +352,10 @@ impl ComputerUseLinux {
             }
             .await;
             match result {
-                Ok(capture) => (Some(capture), None),
+                Ok(capture) => {
+                    self.cache_payload(&capture, window_context.is_some());
+                    (Some(capture), None)
+                }
                 Err(error) => (None, Some(format!("{error:#}"))),
             }
         } else {
@@ -523,6 +529,7 @@ impl ComputerUseLinux {
             prepare_screenshot_payload(capture, params.screenshot_options()).map_err(|e| {
                 ErrorData::internal_error(format!("screenshot resize failed: {e}"), None)
             })?;
+        self.cache_payload(&capture, cropped);
 
         let mut caption = serde_json::json!({
             "width": capture.width,
@@ -623,6 +630,12 @@ impl ComputerUseLinux {
     async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        // Payload pixels from a downscaled screenshot map back to capture
+        // space here; AT-SPI-resolved points bypass params and stay untouched.
+        // Relative offsets are handled in the window-target branch below.
+        if params.relative != Some(true) {
+            self.upscale_absolute_point(&mut params.x, &mut params.y);
+        }
         let mut portal_target_point = None;
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
@@ -675,6 +688,11 @@ impl ComputerUseLinux {
                         });
                     }
                 };
+                self.upscale_relative_point(
+                    &mut params.x,
+                    &mut params.y,
+                    coordinate_map.capture_rect,
+                );
                 if let Err(message) = apply_window_relative_click_coordinates(
                     &mut params,
                     coordinate_map.capture_rect,
@@ -1010,6 +1028,11 @@ impl ComputerUseLinux {
     async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        // Same payload-to-capture mapping as click; element-resolved points
+        // bypass params and stay untouched.
+        if params.relative != Some(true) {
+            self.upscale_absolute_point(&mut params.x, &mut params.y);
+        }
         let mut portal_target_point = None;
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
         // Raise/focus the target window first (parity with click) so wheel
@@ -1062,6 +1085,11 @@ impl ComputerUseLinux {
                         });
                     }
                 };
+                self.upscale_relative_point(
+                    &mut params.x,
+                    &mut params.y,
+                    coordinate_map.capture_rect,
+                );
                 if let Err(message) = apply_window_relative_scroll_coordinates(
                     &mut params,
                     coordinate_map.capture_rect,
@@ -1273,9 +1301,16 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
-        let received = Some(serde_json::json!(params));
+    async fn drag(&self, Parameters(mut params): Parameters<DragParams>) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        // Same payload-to-capture mapping as click, applied to both endpoints.
+        let (start_x, start_y) = self.upscale_absolute_pair(params.start_x, params.start_y);
+        let (end_x, end_y) = self.upscale_absolute_pair(params.end_x, params.end_y);
+        params.start_x = start_x;
+        params.start_y = start_y;
+        params.end_x = end_x;
+        params.end_y = end_y;
         // Preferred backend: the uinput absolute pointer (accurate landing).
         if self.ensure_abs_pointer().await {
             let abs_pointer = Arc::clone(&self.abs_pointer);
@@ -3096,6 +3131,101 @@ impl ComputerUseLinux {
         }
     }
 
+    /// Remember the payload just returned to the caller so coordinate actions
+    /// can map payload pixels back to capture space.
+    fn cache_payload(&self, capture: &ScreenshotCapture, cropped: bool) {
+        if capture.width == 0 || capture.height == 0 {
+            return;
+        }
+        if let Ok(mut guard) = self.last_payload.lock() {
+            *guard = Some(ReturnedPayload {
+                payload_width: capture.width,
+                payload_height: capture.height,
+                coordinate_width: capture.coordinate_width,
+                coordinate_height: capture.coordinate_height,
+                cropped,
+            });
+        }
+    }
+
+    /// Last returned payload dims, or None when no screenshot went out yet.
+    fn cached_payload(&self) -> Option<ReturnedPayload> {
+        self.last_payload.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// Map an absolute point from payload to capture space. Values outside
+    /// the payload bounds are already coordinate-space (or invalid) and pass
+    /// through for the existing off-screen handling.
+    fn upscale_absolute_pair(&self, x: i32, y: i32) -> (i32, i32) {
+        let Some(payload) = self.cached_payload() else {
+            return (x, y);
+        };
+        if payload.cropped {
+            return (x, y);
+        }
+        let desktop = self.desktop_size.lock().ok().and_then(|guard| *guard);
+        if desktop != Some((payload.coordinate_width, payload.coordinate_height)) {
+            return (x, y);
+        }
+        let in_payload = x >= 0
+            && y >= 0
+            && (x as u32) < payload.payload_width
+            && (y as u32) < payload.payload_height;
+        if !in_payload {
+            return (x, y);
+        }
+        (
+            payload_axis_to_capture(x, payload.payload_width, payload.coordinate_width),
+            payload_axis_to_capture(y, payload.payload_height, payload.coordinate_height),
+        )
+    }
+
+    /// Map an optional absolute point from payload to capture space.
+    fn upscale_absolute_point(&self, x: &mut Option<i32>, y: &mut Option<i32>) {
+        if let (Some(x_value), Some(y_value)) = (*x, *y) {
+            let (x_mapped, y_mapped) = self.upscale_absolute_pair(x_value, y_value);
+            *x = Some(x_mapped);
+            *y = Some(y_mapped);
+        }
+    }
+
+    /// Map a window-relative offset from payload to capture space, but only
+    /// when the cached crop still matches the target rect.
+    fn upscale_relative_point(
+        &self,
+        x: &mut Option<i32>,
+        y: &mut Option<i32>,
+        rect: (i32, i32, u32, u32),
+    ) {
+        if let (Some(x_value), Some(y_value)) = (*x, *y) {
+            let Some(payload) = self.cached_payload() else {
+                return;
+            };
+            if !payload.cropped
+                || (payload.coordinate_width, payload.coordinate_height) != (rect.2, rect.3)
+            {
+                return;
+            }
+            let in_payload = x_value >= 0
+                && y_value >= 0
+                && (x_value as u32) < payload.payload_width
+                && (y_value as u32) < payload.payload_height;
+            if !in_payload {
+                return;
+            }
+            *x = Some(payload_axis_to_capture(
+                x_value,
+                payload.payload_width,
+                payload.coordinate_width,
+            ));
+            *y = Some(payload_axis_to_capture(
+                y_value,
+                payload.payload_height,
+                payload.coordinate_height,
+            ));
+        }
+    }
+
     fn logical_portal_point(
         &self,
         session: &PortalPointerSession,
@@ -4055,6 +4185,18 @@ impl WindowCoordinateMap {
     }
 }
 
+/// Dimensions of the screenshot payload last returned to the caller.
+/// Payload pixels map back to capture pixels by the per-axis ratio
+/// coordinate / payload.
+#[derive(Debug, Clone, Copy)]
+struct ReturnedPayload {
+    payload_width: u32,
+    payload_height: u32,
+    coordinate_width: u32,
+    coordinate_height: u32,
+    cropped: bool,
+}
+
 fn map_coordinate_between_rects(
     value: i32,
     source_origin: i32,
@@ -4065,6 +4207,16 @@ fn map_coordinate_between_rects(
     let offset = i64::from(value) - i64::from(source_origin);
     let scaled = offset.saturating_mul(i64::from(target_size)) / i64::from(source_size.max(1));
     (i64::from(target_origin) + scaled).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Map one axis from screenshot-payload pixels to capture pixels.
+/// Identity when the payload was not downscaled on this axis.
+fn payload_axis_to_capture(value: i32, payload: u32, coordinate: u32) -> i32 {
+    if payload == 0 || payload == coordinate {
+        return value;
+    }
+    (i64::from(value) * i64::from(coordinate) / i64::from(payload))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 fn logical_window_crop_rect(
@@ -6356,6 +6508,81 @@ mod tests {
                 "300".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn payload_axis_upscales_downscaled_coordinates() {
+        // A 1920-wide desktop returned at 960 payload pixels: payload x=480
+        // is capture x=960.
+        assert_eq!(payload_axis_to_capture(480, 960, 1920), 960);
+        assert_eq!(payload_axis_to_capture(270, 540, 1080), 540);
+    }
+
+    #[test]
+    fn payload_axis_is_identity_without_downscale() {
+        assert_eq!(payload_axis_to_capture(500, 1920, 1920), 500);
+        assert_eq!(payload_axis_to_capture(2000, 1920, 1920), 2000);
+        assert_eq!(payload_axis_to_capture(100, 0, 1920), 100);
+    }
+
+    fn backend_with_payload(
+        payload_width: u32,
+        payload_height: u32,
+        coordinate_width: u32,
+        coordinate_height: u32,
+        cropped: bool,
+        desktop: (u32, u32),
+    ) -> ComputerUseLinux {
+        let backend = ComputerUseLinux::default();
+        *backend.last_payload.lock().unwrap() = Some(ReturnedPayload {
+            payload_width,
+            payload_height,
+            coordinate_width,
+            coordinate_height,
+            cropped,
+        });
+        *backend.desktop_size.lock().unwrap() = Some(desktop);
+        backend
+    }
+
+    #[test]
+    fn upscale_absolute_pair_maps_downscaled_full_desktop_payload() {
+        let backend = backend_with_payload(960, 540, 1920, 1080, false, (1920, 1080));
+        assert_eq!(backend.upscale_absolute_pair(480, 270), (960, 540));
+    }
+
+    #[test]
+    fn upscale_absolute_pair_passes_through_out_of_payload_points() {
+        let backend = backend_with_payload(960, 540, 1920, 1080, false, (1920, 1080));
+        // Capture-space values stay untouched for off-screen handling.
+        assert_eq!(backend.upscale_absolute_pair(1500, 900), (1500, 900));
+        assert_eq!(backend.upscale_absolute_pair(-10, 50), (-10, 50));
+    }
+
+    #[test]
+    fn upscale_absolute_pair_ignores_cropped_or_stale_payloads() {
+        let cropped = backend_with_payload(960, 540, 1920, 1080, true, (1920, 1080));
+        assert_eq!(cropped.upscale_absolute_pair(480, 270), (480, 270));
+        let stale = backend_with_payload(960, 540, 1920, 1080, false, (1280, 720));
+        assert_eq!(stale.upscale_absolute_pair(480, 270), (480, 270));
+        let fresh = ComputerUseLinux::default();
+        assert_eq!(fresh.upscale_absolute_pair(480, 270), (480, 270));
+    }
+
+    #[test]
+    fn upscale_relative_point_maps_matching_crop() {
+        let backend = backend_with_payload(100, 50, 200, 100, true, (1920, 1080));
+        let (mut x, mut y) = (Some(50), Some(25));
+        backend.upscale_relative_point(&mut x, &mut y, (10, 10, 200, 100));
+        assert_eq!((x, y), (Some(100), Some(50)));
+    }
+
+    #[test]
+    fn upscale_relative_point_ignores_mismatched_crop() {
+        let backend = backend_with_payload(100, 50, 200, 100, true, (1920, 1080));
+        let (mut x, mut y) = (Some(50), Some(25));
+        backend.upscale_relative_point(&mut x, &mut y, (10, 10, 300, 200));
+        assert_eq!((x, y), (Some(50), Some(25)));
     }
 
     #[test]
